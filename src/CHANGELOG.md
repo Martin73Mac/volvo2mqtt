@@ -1,3 +1,9 @@
+## v1.13.6
+
+### 🐛 Bug Fixes:
+
+- Fix `TypeError: 'NoneType' object is not subscriptable` on startup when the Volvo API returns `null` for a value the car does not provide (e.g. `averageEnergyConsumption`)
+
 ## v1.13.5
 
 ### 🐛 Bug Fixes:
