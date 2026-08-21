@@ -28,6 +28,9 @@ token_expires_at: datetime
 refresh_token = None
 vins = []
 supported_endpoints = {}
+# Endpoints that returned no data at startup. Kept so they can be retried later
+# instead of being written off for the lifetime of the process.
+unsupported_endpoints = {}
 cached_requests = {}
 vcc_api_keys = []
 backend_status = ""
@@ -360,41 +363,74 @@ def change_vcc_api_key():
     get_vcc_api_keys(used_vcc_api_key)
 
 
-def get_vehicle_details(vin):
-    response = session.get(VEHICLE_DETAILS_URL.format(vin), timeout=15)
-    if response.status_code == 200:
-        data = response.json()["data"]
-        logging.debug(response.text)
-        device = {
-            "identifiers": [f"volvoAAOS2mqtt_{vin}"],
-            "manufacturer": "Volvo",
-            "model": data['descriptions']['model'],
-            "name": f"{data['descriptions']['model']} ({data['modelYear']}) - {vin}",
-        }
-        mqtt.send_car_images(vin, data, device)
-    elif response.status_code == 500 and not settings.volvoData["vin"]:
-        # Workaround for some cars that are not returning vehicle details
-        device = {
-            "identifiers": [f"volvoAAOS2mqtt_{vin}"],
-            "manufacturer": "Volvo",
-            "model": vin,
-            "name": f"Volvo - {vin}",
-        }
-    else:
-        raise Exception("Getting vehicle details failed. Status Code: " + str(response.status_code) +
-                        ". Error: " + response.text)
+def get_vehicle_details(vin, attempts=3):
+    # The device name is cosmetic, so a failure here must never stop the addon.
+    # It used to raise, which killed startup before any entity was published.
+    generic_device = {
+        "identifiers": [f"volvoAAOS2mqtt_{vin}"],
+        "manufacturer": "Volvo",
+        "model": vin,
+        "name": f"Volvo - {vin}",
+    }
 
-    return device
+    for attempt in range(1, attempts + 1):
+        try:
+            response = session.get(VEHICLE_DETAILS_URL.format(vin), timeout=15)
+        except requests.exceptions.RequestException as error:
+            logging.warning(f"Error getting vehicle details for {vin} "
+                            f"(attempt {attempt}/{attempts}): {error}")
+            time.sleep(5)
+            continue
+
+        if response.status_code == 200:
+            logging.debug(response.text)
+            try:
+                data = response.json()["data"]
+                device = {
+                    "identifiers": [f"volvoAAOS2mqtt_{vin}"],
+                    "manufacturer": "Volvo",
+                    "model": data['descriptions']['model'],
+                    "name": f"{data['descriptions']['model']} ({data['modelYear']}) - {vin}",
+                }
+            except (JSONDecodeError, KeyError, TypeError) as error:
+                logging.warning(f"Unexpected vehicle details for {vin}, using a generic "
+                                f"device name: {error}")
+                return generic_device
+
+            try:
+                mqtt.send_car_images(vin, data, device)
+            except Exception as error:
+                # Car pictures are optional, never let them break device creation
+                logging.warning(f"Could not publish car images for {vin}: {error}")
+            return device
+
+        if response.status_code == 500:
+            # Some cars never return vehicle details
+            logging.warning(f"Vehicle details not available for {vin}, using a generic device name")
+            return generic_device
+
+        logging.warning(f"Getting vehicle details for {vin} failed (attempt {attempt}/{attempts}). "
+                        f"Status Code: {response.status_code}. Error: {response.text}")
+        time.sleep(5)
+
+    logging.error(f"Could not get vehicle details for {vin} after {attempts} attempts, "
+                  f"using a generic device name")
+    return generic_device
+
+
+def is_duplicate_battery_sensor(vin, entity):
+    # If battery charge level could be found in recharge-api, skip the second battery charge sensor
+    return entity["id"] == "battery_charge_level" and entity.get("url") == FUEL_BATTERY_STATE_URL \
+        and any("battery_charge_level" in d["id"] for d in supported_endpoints[vin])
 
 
 def check_supported_endpoints():
-    global supported_endpoints
+    global supported_endpoints, unsupported_endpoints
     for vin in vins:
         supported_endpoints[vin] = []
+        unsupported_endpoints[vin] = []
         for entity in supported_entities:
-            if entity["id"] == "battery_charge_level" and entity["url"] == FUEL_BATTERY_STATE_URL \
-                    and any("battery_charge_level" in d["id"] for d in supported_endpoints[vin]):
-                # If battery charge level could be found in recharge-api, skip the second battery charge sensor
+            if is_duplicate_battery_sensor(vin, entity):
                 continue
 
             if entity.get('url'):
@@ -406,7 +442,38 @@ def check_supported_endpoints():
                 logging.info("Success! " + entity["name"] + " is supported by your vehicle.")
                 supported_endpoints[vin].append(entity)
             else:
-                logging.info("Failed, " + entity["name"] + " is unfortunately not supported by your vehicle.")
+                # No data. That can mean the car does not have the feature, but also
+                # that the call failed, so keep it for a later retry rather than
+                # writing it off until the next restart.
+                unsupported_endpoints[vin].append(entity)
+                logging.info("No data for " + entity["name"] + ", it is not supported by your vehicle "
+                             "or the API call failed. Will be retried later.")
+
+
+def recheck_unsupported_endpoints():
+    """Retry endpoints that returned no data earlier.
+
+    Returns the list of (vin, entity) pairs that produce data now, so their
+    discovery configs can be published. Endpoints are never removed here: one
+    failed call must not delete an entity the user already has in HA.
+    """
+    global supported_endpoints, unsupported_endpoints
+    recovered = []
+    for vin in vins:
+        for entity in list(unsupported_endpoints.get(vin, [])):
+            if is_duplicate_battery_sensor(vin, entity):
+                unsupported_endpoints[vin].remove(entity)
+                continue
+
+            if api_call(entity["url"], "GET", vin, entity["id"], True) is None:
+                continue
+
+            logging.info(f"{entity['name']} returns data now, adding it for {vin}")
+            supported_endpoints[vin].append(entity)
+            unsupported_endpoints[vin].remove(entity)
+            recovered.append((vin, entity))
+
+    return recovered
 
 
 def initialize_scheduler(vins):
@@ -515,18 +582,18 @@ def api_call(url, method, vin, sensor_id=None, force_update=False, key_change=Fa
             # Exception caught while getting data from volvo api, doing nothing
             return None
     elif method == "GET":
-        logging.debug(f"Starting {method} call against {url}")
+        logging.debug(f"Starting {method} call against {url.format(vin)}")
         try:
             response = session.get(url.format(vin), timeout=15)
         except requests.exceptions.RequestException as e:
-            logging.error(f"Error getting data: {e} from {url}")
+            logging.error(f"Error getting data: {e} from {url.format(vin)}")
             return None
     elif method == "POST":
-        logging.debug(f"Starting {method} call against {url}")
+        logging.debug(f"Starting {method} call against {url.format(vin)}")
         try:
             response = session.post(url.format(vin), timeout=20)
         except requests.exceptions.RequestException as e:
-            logging.error(f"Error getting data from {url} : {e}")
+            logging.error(f"Error getting data from {url.format(vin)} : {e}")
             return None
     else:
         logging.error(f"Unkown method posted: {method}. Returning nothing")
@@ -556,46 +623,59 @@ def api_call(url, method, vin, sensor_id=None, force_update=False, key_change=Fa
             if "Out of call volume quota" in data["message"]:
                 logging.warning("Quota extended. Try to change VCCAPIKEY!")
                 change_vcc_api_key()
-                api_call(url, method, vin, sensor_id, force_update, True)
+                if not key_change:
+                    # Return the retry result. Dropping it marked endpoints as
+                    # unsupported even though the new key fetched the data fine.
+                    return api_call(url, method, vin, sensor_id, force_update, True)
+                logging.error(f"Still out of quota after changing the key, giving up on "
+                              f"{url.format(vin)}")
             else:
                 logging.error(
-                    f"API Call failed to {url}. Status Code: {response.status_code}. Error: {response.text}")
+                    f"API Call failed to {url.format(vin)}. Status Code: {response.status_code}. "
+                    f"Error: {response.text}")
         else:
-            logging.error(f"API Call failed to {url}. Status Code: {response.status_code}. Error: {response.text}")
+            logging.error(f"API Call failed to {url.format(vin)}. Status Code: {response.status_code}. "
+                          f"Error: {response.text}")
         return None
 
 
 def cached_request(url, method, vin, force_update=False, key_change=False):
     global cached_requests
-    if not util.keys_exists(cached_requests, vin + "_" + url):
+    cache_key = vin + "_" + url
+    if not util.keys_exists(cached_requests, cache_key):
         # No API Data cached, get fresh data from API
-        logging.debug(f"Starting {method} call against {url}")
-        try:
-            response = session.get(url.format(vin), timeout=15)
-        except requests.exceptions.RequestException as e:
-            logging.error(f"Error getting data from {url}: {e}")
-            return None
-
-        data = {"response": response, "last_update": datetime.now(util.TZ)}
-        cached_requests[vin + "_" + url] = data
+        response = do_cached_request(url, method, vin)
     else:
-        if (datetime.now(util.TZ) - cached_requests[vin + "_" + url]["last_update"]).total_seconds() \
+        if (datetime.now(util.TZ) - cached_requests[cache_key]["last_update"]).total_seconds() \
                 >= settings["updateInterval"] or (force_update and
-                                                  (datetime.now(util.TZ) - cached_requests[vin + "_" + url][
+                                                  (datetime.now(util.TZ) - cached_requests[cache_key][
                                                       "last_update"]).total_seconds() >= 2) \
                 or key_change:
             # Old Data in Cache, or force mode active, updating
-            logging.debug(f"Starting {method} call against {url}")
-            try:
-                response = session.get(url.format(vin), timeout=15)
-            except requests.exceptions.RequestException as e:
-                logging.error(f"Error getting data from {url} : {e}")
-                return None
-            data = {"response": response, "last_update": datetime.now(util.TZ)}
-            cached_requests[vin + "_" + url] = data
+            response = do_cached_request(url, method, vin)
         else:
             # Data is up do date, returning cached data
-            response = cached_requests[vin + "_" + url]["response"]
+            response = cached_requests[cache_key]["response"]
+    return response
+
+
+def do_cached_request(url, method, vin):
+    global cached_requests
+    logging.debug(f"Starting {method} call against {url.format(vin)}")
+    try:
+        response = session.get(url.format(vin), timeout=15)
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error getting data from {url.format(vin)}: {e}")
+        return None
+
+    if response.status_code == 200:
+        cached_requests[vin + "_" + url] = {"response": response, "last_update": datetime.now(util.TZ)}
+    else:
+        # Never cache a failure. One 403 or 5xx used to be replayed to every entity
+        # sharing this url for a whole update interval, losing all of them at once.
+        logging.debug(f"Not caching status {response.status_code} for {url.format(vin)}")
+        cached_requests.pop(vin + "_" + url, None)
+
     return response
 
 

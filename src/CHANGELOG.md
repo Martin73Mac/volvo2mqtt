@@ -1,3 +1,23 @@
+## v1.13.11
+
+### 🚀 Features:
+
+- Endpoints that return no data at startup are retried every 6 hours instead of being written off until the next restart. Recovered endpoints get their discovery config published straight away. Endpoints are never removed by a recheck, so a single failed call cannot delete an entity
+- `Failed, X is unfortunately not supported by your vehicle` now says that the call may simply have failed, because that log line could not tell the difference
+- API call logs show the real URL with the VIN instead of the unformatted `{0}` template
+
+### 🐛 Bug Fixes:
+
+- A failure while fetching vehicle details no longer stops the add-on. The call is retried, falls back to a generic device name, and `create_ha_devices()` is retried instead of propagating out of the update loop
+- Publish the result of the retry after a `Out of call volume quota` 403. It was discarded, so endpoints were marked unsupported even though the new key fetched the data fine. The retry is also bounded now, it could recurse indefinitely when every key was out of quota
+- Never cache a failed API response. One 403 or 5xx was replayed to every entity sharing that URL for a whole update interval, losing all of them at once
+- `update_ha_device()` built its own discovery payload, which had drifted from the one `create_ha_devices()` builds: it dropped `min`/`max`/`mode` for numbers and the attributes topic for warnings and active schedules, so republishing a config quietly downgraded the entity. Both now share one builder
+- `subscribed_topics` grew without bound, one duplicate entry per command entity per update
+- The warnings sensor reported `0` warnings when its API call failed, which reads as "no warnings"
+- Publish states that are empty rather than skipping them, so a value that goes away clears its retained message instead of leaving a stale reading in HA forever
+- Serialise `update_car_data()`, it runs from the update loop, MQTT command callbacks and the climate/lock threads at the same time
+- `delete_old_entities()` cleared renamed entities' config topics but left their state and attributes topics behind as orphaned retained messages
+
 ## v1.13.10
 
 ### 🐛 Bug Fixes:

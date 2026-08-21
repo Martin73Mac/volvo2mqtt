@@ -21,6 +21,11 @@ mqtt_client: mqtt.Client
 # the broker connection down mid-discovery (rc=7) and costs us the entity configs.
 IMAGE_WIDTH = 600
 IMAGE_MAX_BYTES = 256 * 1024
+# How often to retry endpoints that returned no data at startup
+ENDPOINT_RECHECK_SECONDS = 6 * 3600
+# update_car_data runs from the update loop, from MQTT command callbacks and from
+# climate/lock threads. Reentrant because api_call can call back into it on a 503.
+update_lock = threading.RLock()
 subscribed_topics = []
 assumed_climate_state = {}
 last_data_update = None
@@ -335,13 +340,26 @@ def start_climate(vin):
 
 
 def update_loop():
-    create_ha_devices()
+    # Keep retrying, a failure here used to propagate out of update_loop and stop
+    # the addon with no entity ever published
+    while True:
+        try:
+            create_ha_devices()
+            break
+        except Exception as error:
+            logging.error(f"Exception {error} while creating HA devices. Retrying in 60 seconds.")
+            time.sleep(60)
+
+    last_endpoint_recheck = datetime.now(util.TZ)
     while True:
         if settings["updateInterval"] > 0:
             logging.info("Sending mqtt update...")
             try:
                 send_heartbeat()
                 update_car_data()
+                if (datetime.now(util.TZ) - last_endpoint_recheck).total_seconds() >= ENDPOINT_RECHECK_SECONDS:
+                    last_endpoint_recheck = datetime.now(util.TZ)
+                    recheck_unsupported_endpoints()
                 logging.info(f"Mqtt update done. Next run in {settings['updateInterval']} seconds.")
             except Exception as error:
                 logging.info(f"Exception {error} in Mqtt update. Next run in {settings['updateInterval']} seconds.")
@@ -352,6 +370,11 @@ def update_loop():
 
 
 def update_car_data(force_update=False, overwrite={}):
+    with update_lock:
+        publish_car_data(force_update, overwrite)
+
+
+def publish_car_data(force_update=False, overwrite={}):
     global last_data_update
     last_data_update = format_datetime(datetime.now(util.TZ), format="medium", locale=settings["babelLocale"])
     for vin in volvo.vins:
@@ -389,22 +412,25 @@ def update_car_data(force_update=False, overwrite={}):
             if entity["domain"] == "device_tracker" or entity["id"] == "active_schedules":
                 topic = f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/attributes"
             elif entity["id"] == "warnings":
-                mqtt_client.publish(
-                    f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/attributes",
-                    json.dumps(state),
-                    retain=True
-                )
-                if state:
-                    state = sum(value == "FAILURE" for value in state.values())
-                else:
-                    state = 0
+                if state is not None:
+                    # Only report a count when the call actually returned something,
+                    # publishing 0 on a failed call reads as "no warnings"
+                    mqtt_client.publish(
+                        f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/attributes",
+                        json.dumps(state),
+                        retain=True
+                    )
+                    state = sum(value == "FAILURE" for value in state.values()) if state else 0
 
                 topic = f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/state"
             else:
                 topic = f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/state"
 
             logging.info(f"update_car_data {topic} {state}")
-            if state or state == 0:
+            # None means the call failed, keep whatever HA already has. Anything else
+            # is published, including "" and 0, so a value that goes away clears the
+            # retained message instead of leaving a stale reading behind forever.
+            if state is not None:
                 mqtt_client.publish(
                     topic,
                     json.dumps(state) if isinstance(state, dict) or isinstance(state, list) else state,
@@ -431,16 +457,28 @@ def update_ha_device(entity, vin, state):
         return None
 
     logging.debug("Updating icon to " + icon + " for " + entity["id"])
+    publish_entity_config(vin, entity, devices[vin], icon)
+
+
+def build_entity_config(vin, entity, device, icon=None):
+    """Build the MQTT discovery payload for one entity.
+
+    Shared by create_ha_devices() and update_ha_device(). They used to build this
+    separately and had drifted: the update path dropped min/max/mode for numbers
+    and the attributes topic for warnings and active_schedules, so republishing a
+    config quietly downgraded the entity.
+    """
     config = {
         "name": entity['name'],
         "default_entity_id": f"{entity['domain']}.volvo_{vin}_{entity['id']}",
         "schema": "state",
         "icon": f"mdi:{icon}" if icon else f"mdi:{entity['icon']}",
         "state_topic": f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/state",
-        "device": devices[vin],
+        "device": device,
         "unique_id": f"volvoAAOS2mqtt_{vin}_{entity['id']}",
         "availability_topic": availability_topic
     }
+
     if entity.get("device_class"):
         config["device_class"] = entity["device_class"]
 
@@ -450,21 +488,48 @@ def update_ha_device(entity, vin, state):
     if entity.get("state_class"):
         config["state_class"] = entity["state_class"]
 
-    if entity.get("domain") == "device_tracker":
+    if (entity.get("domain") == "device_tracker" or entity.get("id") == "active_schedules"
+            or entity.get("id") == "warnings"):
         config["json_attributes_topic"] = f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/attributes"
 
-    if entity.get("domain") in ["switch", "lock", "button"]:
+    if entity.get("domain") in ["switch", "lock", "button", "number"]:
         command_topic = f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/command"
         config["command_topic"] = command_topic
-        subscribed_topics.append(command_topic)
+        # Guard against duplicates, this used to append on every single update and
+        # grow subscribed_topics without bound
+        if command_topic not in subscribed_topics:
+            subscribed_topics.append(command_topic)
         mqtt_client.subscribe(command_topic)
 
+        if entity["domain"] == "number":
+            config["min"] = entity["min"]
+            config["max"] = entity["max"]
+            config["mode"] = entity["mode"]
+    elif entity.get("domain") == "image":
+        config["url_topic"] = f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/image_url"
+
+    return config
+
+
+def publish_entity_config(vin, entity, device, icon=None):
     mqtt_client.publish(
         f"homeassistant/{entity['domain']}/volvoAAOS2mqtt/{vin}_{entity['id']}/config",
-        json.dumps(config),
+        json.dumps(build_entity_config(vin, entity, device, icon)),
         qos=1,
         retain=True
     )
+
+
+def recheck_unsupported_endpoints():
+    # Under the same lock as update_car_data: this appends to the very list that
+    # publish_car_data iterates over
+    with update_lock:
+        recovered = volvo.recheck_unsupported_endpoints()
+    for vin, entity in recovered:
+        publish_entity_config(vin, entity, devices[vin])
+        time.sleep(0.05)
+    if recovered:
+        logging.info(f"Added {len(recovered)} endpoints that returned data on recheck")
 
 
 def create_ha_devices():
@@ -474,49 +539,7 @@ def create_ha_devices():
         devices[vin] = device
         logging.info(f"Publishing {len(volvo.supported_endpoints[vin])} entity configs for {vin}")
         for entity in volvo.supported_endpoints[vin]:
-            config = {
-                "name": entity['name'],
-                "default_entity_id": f"{entity['domain']}.volvo_{vin}_{entity['id']}",
-                "schema": "state",
-                "icon": f"mdi:{entity['icon']}",
-                "state_topic": f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/state",
-                "device": device,
-                "unique_id": f"volvoAAOS2mqtt_{vin}_{entity['id']}",
-                "availability_topic": availability_topic
-            }
-
-            if entity.get("device_class"):
-                config["device_class"] = entity["device_class"]
-
-            if entity.get("unit"):
-                config["unit_of_measurement"] = entity["unit"]
-
-            if entity.get("state_class"):
-                config["state_class"] = entity["state_class"]
-
-            if (entity.get("domain") == "device_tracker" or entity.get("id") == "active_schedules"
-                    or entity.get("id") == "warnings"):
-                config["json_attributes_topic"] = f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/attributes"
-
-            if entity.get("domain") in ["switch", "lock", "button", "number"]:
-                command_topic = f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/command"
-                config["command_topic"] = command_topic
-                subscribed_topics.append(command_topic)
-                mqtt_client.subscribe(command_topic)
-
-                if entity["domain"] == "number":
-                    config["min"] = entity["min"]
-                    config["max"] = entity["max"]
-                    config["mode"] = entity["mode"]
-            elif entity.get("domain") == "image":
-                config["url_topic"] = f"homeassistant/{entity['domain']}/{vin}_{entity['id']}/image_url"
-
-            mqtt_client.publish(
-                f"homeassistant/{entity['domain']}/volvoAAOS2mqtt/{vin}_{entity['id']}/config",
-                json.dumps(config),
-                qos=1,
-                retain=True
-            )
+            publish_entity_config(vin, entity, device)
             # Pace the burst. Publishing ~50 configs per car back to back overruns the
             # socket buffer, and everything still queued is lost when the broker drops us.
             time.sleep(0.05)
@@ -535,5 +558,9 @@ def send_offline():
 def delete_old_entities():
     for vin in volvo.vins:
         for entity in old_entity_ids:
-            topic = f"homeassistant/sensor/volvoAAOS2mqtt/{vin}_{entity}/config"
-            mqtt_client.publish(topic, payload="", retain=True)
+            # Clear the config so HA drops the entity, and the state and attributes
+            # topics too, which used to be left behind as orphaned retained messages
+            for topic in [f"homeassistant/sensor/volvoAAOS2mqtt/{vin}_{entity}/config",
+                          f"homeassistant/sensor/{vin}_{entity}/state",
+                          f"homeassistant/sensor/{vin}_{entity}/attributes"]:
+                mqtt_client.publish(topic, payload="", retain=True)
