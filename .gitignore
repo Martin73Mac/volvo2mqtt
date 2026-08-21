@@ -1,5 +1,6 @@
 .idea
 venv
+__pycache__/
 src/settings.dev.json
 .env
 /src/volvo2mqtt.log

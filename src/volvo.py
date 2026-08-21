@@ -765,6 +765,9 @@ def parse_api_data(data, sensor_id=None):
             warnings = 0
             cleaned_data = {}
             for key, dicts in data.items():
+                if not isinstance(dicts, dict):
+                    # API returns null for warnings the car does not provide
+                    continue
                 contains_data = sum(value == "NO_WARNING" or value == "FAILURE" for value in dicts.values())
                 if contains_data:
                     warnings = warnings + 1
