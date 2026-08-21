@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 import paho.mqtt.client as mqtt
 import json
@@ -15,6 +16,11 @@ from const import CLIMATE_START_URL, CLIMATE_STOP_URL, CAR_LOCK_URL, \
     CAR_UNLOCK_URL, availability_topic, icon_states, old_entity_ids, otp_mqtt_topic
 
 mqtt_client: mqtt.Client
+# Car images are the only large payloads this addon publishes. Ask the CDN for a
+# narrow render and refuse to publish anything oversized: a multi-MB message takes
+# the broker connection down mid-discovery (rc=7) and costs us the entity configs.
+IMAGE_WIDTH = 600
+IMAGE_MAX_BYTES = 256 * 1024
 subscribed_topics = []
 assumed_climate_state = {}
 last_data_update = None
@@ -125,31 +131,33 @@ def send_car_images(vin, data, device):
                        "sec-ch-ua-platform": "\"Windows\"", "sec-fetch-dest": "document", "Accept-Encoding": "gzip, deflate, br, zstd",
                        "sec-fetch-mode": "navigate", "sec-fetch-site": "none", "sec-fetch-user": "?1", "upgrade-insecure-requests": "1"}
 
-            # Post Images
-            if not os.path.exists(f'{entity["id"]}_{vin}.png'):
+            # Post Images. The width is part of the file name so a cached full size
+            # image from an older version is not reused.
+            image_file = f'{entity["id"]}_{vin}_w{IMAGE_WIDTH}.png'
+            if not os.path.exists(image_file):
                 data_path = "exteriorImageUrl" if entity["id"] == "exterior_image" else "internalImageUrl"
-                response = requests.get(data["images"][data_path], headers=headers)
+                image_url = re.sub(r"([?&]w=)\d+", r"\g<1>" + str(IMAGE_WIDTH), data["images"][data_path])
+                response = requests.get(image_url, headers=headers)
                 if response.status_code == 200:
-                    with open(f'{entity["id"]}_{vin}.png', 'wb') as image:
+                    with open(image_file, 'wb') as image:
                         image.write(response.content)
                 else:
                     logging.warning("Error getting car images: " + str(response.status_code) + " Message: " + response.text)
 
-            if os.path.exists(f'{entity["id"]}_{vin}.png'):
-                ext_image = open(f'{entity["id"]}_{vin}.png', mode="rb").read()
-                info = mqtt_client.publish(
+            if os.path.exists(image_file):
+                ext_image = open(image_file, mode="rb").read()
+                if len(ext_image) > IMAGE_MAX_BYTES:
+                    logging.warning(f"Not publishing {entity['id']} for {vin}: {len(ext_image) // 1024} KB exceeds "
+                                    f"the {IMAGE_MAX_BYTES // 1024} KB limit, a payload this large drops the "
+                                    f"broker connection and costs us the entity configs")
+                    continue
+                # qos 0 on purpose. A missing car picture is not worth retrying a large
+                # payload forever if the broker refuses it.
+                mqtt_client.publish(
                     image_topic,
                     ext_image,
-                    qos=1,
                     retain=True
                 )
-                try:
-                    # Images are by far the largest payloads we publish. Let one drain
-                    # before queueing more, a multi-MB payload in the middle of the
-                    # discovery burst is what takes the connection down with rc=7.
-                    info.wait_for_publish(30)
-                except (ValueError, RuntimeError) as error:
-                    logging.warning(f"Car image {entity['id']} for {vin} was not published: {error}")
 
 
 def on_connect(client, userdata, flags, rc):

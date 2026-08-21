@@ -1,3 +1,11 @@
+## v1.13.10
+
+### 🐛 Bug Fixes:
+
+- Fix an endless `MQTT disconnected ... rc=7` / `MQTT connected` reconnect loop introduced in v1.13.9. Publishing the multi-MB car images with qos 1 meant paho retried them on every reconnect, so a payload the broker refuses never stopped being resent
+- Car images are now requested at 600px instead of 1920px, are published with qos 0, and are skipped entirely (with a warning) above 256 KB. Entity configs keep qos 1
+- Removed the blocking `wait_for_publish` on images, so startup no longer stalls when the broker is unhappy
+
 ## v1.13.9
 
 ### 🐛 Bug Fixes:
