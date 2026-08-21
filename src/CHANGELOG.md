@@ -1,3 +1,9 @@
+## v1.13.7
+
+### 🐛 Bug Fixes:
+
+- Fix all entities being created as `unnamed_device` on Home Assistant 2026.4+ (upstream Dielee/volvo2mqtt#328). `default_entity_id` must be a full entity id including the domain, e.g. `sensor.volvo_<vin>_odometer` instead of `volvo_<vin>_odometer`
+
 ## v1.13.6
 
 ### 🐛 Bug Fixes:
