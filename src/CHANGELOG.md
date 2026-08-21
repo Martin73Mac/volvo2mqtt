@@ -1,3 +1,15 @@
+## v1.13.9
+
+### 🐛 Bug Fixes:
+
+- Fix most entities missing in Home Assistant with multiple VINs configured. The broker dropped the connection (`rc=7`) during the discovery burst in `create_ha_devices()`, and the qos 0 config messages still queued were silently lost. Based on upstream Dielee/volvo2mqtt#326 / #327:
+  - `clean_session=False` so queued messages survive a reconnect
+  - qos 1 on every discovery config publish
+  - 50 ms pacing between config publishes, and wait for car images (the largest payloads) to drain
+  - reconnect backoff and a 120 s keepalive
+  - subscribe in `on_connect`, so the OTP topic stays subscribed after a reconnect
+- Log how many entity configs are published per VIN
+
 ## v1.13.8
 
 ### 🐛 Bug Fixes:

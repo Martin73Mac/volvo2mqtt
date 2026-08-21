@@ -28,10 +28,12 @@ def connect():
     client_id = "volvoAAOS2mqtt" if os.environ.get("IS_HA_ADDON") \
         else "volvoAAOS2mqtt_" + settings.volvoData["username"].replace("+", "")
     try:
-        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id)
+        # clean_session=False keeps queued qos 1 messages across a reconnect, so
+        # discovery configs are not lost when the broker drops the connection
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1, client_id, clean_session=False)
     except AttributeError:
         # paho-mqtt < 2.0 does not have CallbackAPIVersion
-        client = mqtt.Client(client_id)
+        client = mqtt.Client(client_id, clean_session=False)
 
     if "logging" in settings["mqtt"] and settings["mqtt"]["logging"]:
         mqtt_logger = logging.getLogger("mqtt")
@@ -40,6 +42,7 @@ def connect():
     client.on_message = safe_on_message
     client.on_disconnect = on_disconnect
     client.on_connect = on_connect
+    client.reconnect_delay_set(min_delay=1, max_delay=30)
 
     client.will_set(availability_topic, "offline", 0, False)
     if settings["mqtt"]["username"] and settings["mqtt"]["password"]:
@@ -50,10 +53,10 @@ def connect():
         if isinstance(conf_port, int):
             if conf_port > 0:
                 port = settings["mqtt"]["port"]
-    client.connect(settings["mqtt"]["broker"], port)
-    
+    # 120s keepalive, the OTP wait can block the main thread for a long time
+    client.connect(settings["mqtt"]["broker"], port, 120)
+
     client.loop_start()
-    client.subscribe("volvoAAOS2mqtt/otp_code")
 
     global mqtt_client
     mqtt_client = client
@@ -76,6 +79,7 @@ def create_otp_input():
     mqtt_client.publish(
         "homeassistant/text/volvoAAOS2mqtt/volvo_otp/config",
         json.dumps(config),
+        qos=1,
         retain=True
     )
 
@@ -113,6 +117,7 @@ def send_car_images(vin, data, device):
             mqtt_client.publish(
                 f"homeassistant/image/volvoAAOS2mqtt/{vin}_{entity['id']}/config",
                 json.dumps(config),
+                qos=1,
                 retain=True
             )
 
@@ -132,11 +137,19 @@ def send_car_images(vin, data, device):
 
             if os.path.exists(f'{entity["id"]}_{vin}.png'):
                 ext_image = open(f'{entity["id"]}_{vin}.png', mode="rb").read()
-                mqtt_client.publish(
+                info = mqtt_client.publish(
                     image_topic,
                     ext_image,
+                    qos=1,
                     retain=True
                 )
+                try:
+                    # Images are by far the largest payloads we publish. Let one drain
+                    # before queueing more, a multi-MB payload in the middle of the
+                    # discovery burst is what takes the connection down with rc=7.
+                    info.wait_for_publish(30)
+                except (ValueError, RuntimeError) as error:
+                    logging.warning(f"Car image {entity['id']} for {vin} was not published: {error}")
 
 
 def on_connect(client, userdata, flags, rc):
@@ -145,6 +158,8 @@ def on_connect(client, userdata, flags, rc):
     logging.info("MQTT connected")
     
     send_heartbeat()
+    # Subscribe here, not right after connect(), so the subscriptions survive a reconnect
+    mqtt_client.subscribe(otp_mqtt_topic)
     if len(subscribed_topics) > 0:
         for topic in subscribed_topics:
             mqtt_client.subscribe(topic)
@@ -439,6 +454,7 @@ def update_ha_device(entity, vin, state):
     mqtt_client.publish(
         f"homeassistant/{entity['domain']}/volvoAAOS2mqtt/{vin}_{entity['id']}/config",
         json.dumps(config),
+        qos=1,
         retain=True
     )
 
@@ -448,6 +464,7 @@ def create_ha_devices():
     for vin in volvo.vins:
         device = volvo.get_vehicle_details(vin)
         devices[vin] = device
+        logging.info(f"Publishing {len(volvo.supported_endpoints[vin])} entity configs for {vin}")
         for entity in volvo.supported_endpoints[vin]:
             config = {
                 "name": entity['name'],
@@ -489,8 +506,12 @@ def create_ha_devices():
             mqtt_client.publish(
                 f"homeassistant/{entity['domain']}/volvoAAOS2mqtt/{vin}_{entity['id']}/config",
                 json.dumps(config),
+                qos=1,
                 retain=True
             )
+            # Pace the burst. Publishing ~50 configs per car back to back overruns the
+            # socket buffer, and everything still queued is lost when the broker drops us.
+            time.sleep(0.05)
     time.sleep(2)
     send_heartbeat()
 
