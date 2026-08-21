@@ -33,7 +33,14 @@ supported_endpoints = {}
 unsupported_endpoints = {}
 cached_requests = {}
 vcc_api_keys = []
+# vin -> vccapikey. Each car gets its own key where there are enough of them, so one
+# car burning through its daily quota does not stop the others.
+vin_api_keys = {}
 backend_status = ""
+
+
+def mask_key(key):
+    return "..." + key[-4:] if key and len(key) > 4 else str(key)
 
 
 def authorize(renew_tokenfile=False):
@@ -112,6 +119,7 @@ def authorize(renew_tokenfile=False):
 
     get_vcc_api_keys()
     get_vehicles()
+    assign_vin_api_keys()
     check_supported_endpoints()
     Thread(target=backend_status_loop,name="backend_status_thread").start()
 
@@ -266,6 +274,36 @@ def get_vehicles():
         logging.info("Vin: " + str(vins) + " found!")
 
 
+def assign_vin_api_keys():
+    """Give every car its own VCCAPIKEY.
+
+    The quota is per key and per day, so spreading the cars over the configured keys
+    multiplies the headroom instead of running one key to exhaustion and rotating.
+    Sorted so the same car keeps the same key across restarts, whatever order the
+    API returns the vehicles in. With fewer keys than cars the keys are shared, with
+    more keys than cars the spares stay available for failover.
+    """
+    global vin_api_keys
+    working_keys = [key["key"] for key in vcc_api_keys if not key.get("extended")]
+    if not working_keys:
+        logging.warning("No working VCCAPIKEY to assign, falling back to a single shared key")
+        return
+
+    for index, vin in enumerate(sorted(vins)):
+        vin_api_keys[vin] = working_keys[index % len(working_keys)]
+        logging.info(f"VIN {vin} is using VCCAPIKEY {mask_key(vin_api_keys[vin])}")
+
+    if len(working_keys) < len(vins):
+        logging.warning(f"{len(vins)} cars but only {len(working_keys)} working VCCAPIKEYs, "
+                        f"some cars have to share one and its quota")
+
+
+def api_key_headers(vin):
+    """Per request override of the session wide vcc-api-key, so each car uses its own."""
+    key = vin_api_keys.get(vin)
+    return {"vcc-api-key": key} if key else None
+
+
 def get_vcc_api_keys(used_key=None):
     working_keys = None
 
@@ -277,7 +315,7 @@ def get_vcc_api_keys(used_key=None):
             for key in setting_keys:
                 set_key_state(key)
 
-        logging.debug(str(vcc_api_keys))
+        logging.debug(str([dict(k, key=mask_key(k["key"])) for k in vcc_api_keys]))
         working_keys = [key["key"] for key in vcc_api_keys if not key.get("extended") and key.get('key') != used_key]
         if len(working_keys) < 1:
             used_key = None
@@ -287,12 +325,12 @@ def get_vcc_api_keys(used_key=None):
         else:
             mqtt.send_heartbeat()
             session.headers.update({"vcc-api-key": working_keys[0]})
-            logging.info("Using VCCAPIKEY: " + working_keys[0])
+            logging.info("Using VCCAPIKEY: " + mask_key(working_keys[0]))
             for key_dict in vcc_api_keys:
                 if key_dict["key"] == working_keys[0]:
                     key_dict["in_use"] = True
 
-        logging.debug(str(vcc_api_keys))
+        logging.debug(str([dict(k, key=mask_key(k["key"])) for k in vcc_api_keys]))
 
 
 def set_key_state(key):
@@ -312,7 +350,7 @@ def set_key_state(key):
 def check_vcc_api_key(test_key, extended_until=None):
     if extended_until:
         if extended_until >= datetime.now():
-            logging.warning("VCCAPIKEY " + test_key + " is extended and will be reusable at: "
+            logging.warning("VCCAPIKEY " + mask_key(test_key) + " is extended and will be reusable at: "
                             + format_datetime(extended_until, format="medium", locale=settings["babelLocale"]))
             return True, extended_until
 
@@ -330,7 +368,7 @@ def check_vcc_api_key(test_key, extended_until=None):
     response = requests.get(VEHICLES_URL, headers=headers)
     data = response.json()
     if response.status_code == 200:
-        logging.debug("VCCAPIKEY " + test_key + " works!")
+        logging.debug("VCCAPIKEY " + mask_key(test_key) + " works!")
         return False, None
     elif response.status_code == 403 and "message" in data:
         if "Out of call volume quota" in data["message"]:
@@ -341,26 +379,38 @@ def check_vcc_api_key(test_key, extended_until=None):
                 extended_until = now + timedelta(hours=int(reusable_in[0]),
                                                  minutes=int(reusable_in[1]),
                                                  seconds=int(reusable_in[2]) + 10)
-                logging.warning("VCCAPIKEY " + test_key + " is extended and will be reusable at: "
+                logging.warning("VCCAPIKEY " + mask_key(test_key) + " is extended and will be reusable at: "
                                 + format_datetime(extended_until, format="medium", locale=settings["babelLocale"]))
         else:
             if "error" in data:
-                logging.warning("VCCAPIKEY " + test_key + " isn't working! " + data["error"]["message"])
+                logging.warning("VCCAPIKEY " + mask_key(test_key) + " isn't working! " + data["error"]["message"])
             else:
-                logging.warning("VCCAPIKEY " + test_key + " isn't working! Statuscode " + str(response.status_code) +
+                logging.warning("VCCAPIKEY " + mask_key(test_key) + " isn't working! Statuscode " + str(response.status_code) +
                                 " Message: " + response.text)
     else:
         if "error" in data:
-            logging.warning("VCCAPIKEY " + test_key + " isn't working! " + data["error"]["message"])
+            logging.warning("VCCAPIKEY " + mask_key(test_key) + " isn't working! " + data["error"]["message"])
         else:
-            logging.warning("VCCAPIKEY " + test_key + " isn't working! Statuscode " + str(response.status_code) +
+            logging.warning("VCCAPIKEY " + mask_key(test_key) + " isn't working! Statuscode " + str(response.status_code) +
                             " Message: " + response.text)
     return True, extended_until
 
 
-def change_vcc_api_key():
-    used_vcc_api_key = session.headers.get("vcc-api-key")
+def change_vcc_api_key(vin=None):
+    used_vcc_api_key = vin_api_keys.get(vin) if vin else session.headers.get("vcc-api-key")
     get_vcc_api_keys(used_vcc_api_key)
+
+    if vin:
+        # Move just this car off the exhausted key. Sharing a key with another car is
+        # still better than losing this car's data for the rest of the day.
+        available = [key["key"] for key in vcc_api_keys
+                     if not key.get("extended") and key["key"] != used_vcc_api_key]
+        if available:
+            vin_api_keys[vin] = available[0]
+            logging.info(f"VIN {vin} moved from VCCAPIKEY {mask_key(used_vcc_api_key)} "
+                         f"to {mask_key(vin_api_keys[vin])}")
+        else:
+            logging.warning(f"No other VCCAPIKEY available for {vin}")
 
 
 def get_vehicle_details(vin, attempts=3):
@@ -375,7 +425,8 @@ def get_vehicle_details(vin, attempts=3):
 
     for attempt in range(1, attempts + 1):
         try:
-            response = session.get(VEHICLE_DETAILS_URL.format(vin), timeout=15)
+            response = session.get(VEHICLE_DETAILS_URL.format(vin), timeout=15,
+                                   headers=api_key_headers(vin))
         except requests.exceptions.RequestException as error:
             logging.warning(f"Error getting vehicle details for {vin} "
                             f"(attempt {attempt}/{attempts}): {error}")
@@ -584,14 +635,14 @@ def api_call(url, method, vin, sensor_id=None, force_update=False, key_change=Fa
     elif method == "GET":
         logging.debug(f"Starting {method} call against {url.format(vin)}")
         try:
-            response = session.get(url.format(vin), timeout=15)
+            response = session.get(url.format(vin), timeout=15, headers=api_key_headers(vin))
         except requests.exceptions.RequestException as e:
             logging.error(f"Error getting data: {e} from {url.format(vin)}")
             return None
     elif method == "POST":
         logging.debug(f"Starting {method} call against {url.format(vin)}")
         try:
-            response = session.post(url.format(vin), timeout=20)
+            response = session.post(url.format(vin), timeout=20, headers=api_key_headers(vin))
         except requests.exceptions.RequestException as e:
             logging.error(f"Error getting data from {url.format(vin)} : {e}")
             return None
@@ -621,8 +672,10 @@ def api_call(url, method, vin, sensor_id=None, force_update=False, key_change=Fa
             return None
         elif response.status_code == 403 and "message" in data:
             if "Out of call volume quota" in data["message"]:
-                logging.warning("Quota extended. Try to change VCCAPIKEY!")
-                change_vcc_api_key()
+                logging.warning(f"Quota extended for VCCAPIKEY "
+                                f"{mask_key(vin_api_keys.get(vin) or session.headers.get('vcc-api-key'))}. "
+                                f"Try to change VCCAPIKEY!")
+                change_vcc_api_key(vin)
                 if not key_change:
                     # Return the retry result. Dropping it marked endpoints as
                     # unsupported even though the new key fetched the data fine.
@@ -663,7 +716,7 @@ def do_cached_request(url, method, vin):
     global cached_requests
     logging.debug(f"Starting {method} call against {url.format(vin)}")
     try:
-        response = session.get(url.format(vin), timeout=15)
+        response = session.get(url.format(vin), timeout=15, headers=api_key_headers(vin))
     except requests.exceptions.RequestException as e:
         logging.error(f"Error getting data from {url.format(vin)}: {e}")
         return None

@@ -1,3 +1,13 @@
+## v1.13.12
+
+### 🚀 Features:
+
+- Use one VCCAPIKEY per vehicle. The quota is per key and per day, so spreading the cars across the configured keys multiplies the headroom instead of running one key to exhaustion and rotating. With 3 cars and 3 keys each car gets its own key and its own quota. No configuration change needed, the existing `vccapikey` list is used as is
+  - assignment is by sorted VIN, so a car keeps the same key across restarts no matter what order the API returns the vehicles in
+  - fewer keys than cars means keys are shared, more keys than cars leaves the spares free for failover
+  - when a car's key runs out of quota only that car is moved to another key, the others are left alone
+- VCCAPIKEYs are masked to their last 4 characters in the log, so a debug log can be shared without leaking them
+
 ## v1.13.11
 
 ### 🚀 Features:
