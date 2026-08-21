@@ -1,3 +1,9 @@
+## v1.13.8
+
+### 🐛 Bug Fixes:
+
+- Sync the `VERSION` constant in `const.py` with the add-on version, so the startup log line reports the version that is actually running (it was left at `v1.13.5` in 1.13.6 and 1.13.7)
+
 ## v1.13.7
 
 ### 🐛 Bug Fixes:
