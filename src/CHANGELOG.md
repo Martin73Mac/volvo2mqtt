@@ -1,3 +1,14 @@
+## v1.13.13
+
+### 🐛 Bug Fixes:
+
+- Fix `Exception: Unknown or invalid client_id` at startup. On 2026-10-26 Volvo stopped accepting the app client ID the add-on logged in with (`h4Yf0b`). Login now uses the current Volvo Cars app client with Authorization Code + PKCE, ported from upstream PR #338
+  - **One new OTP login is needed after updating**: tokens issued to the old client are not valid for the new one. Watch the log for the OTP prompt and post the emailed code to `volvoAAOS2mqtt/otp_code` as before
+- A rejected refresh token now goes straight to an OTP login. It used to call `authorize()` again, which reran vehicle discovery and started a second backend status thread
+- A network error or Volvo 5xx while refreshing at startup is retried 3 times, 60 seconds apart, instead of continuing without a token
+- After a refresh, the token expiry and refresh token were taken from the old token file instead of the new response
+- The refresh token is no longer written to the log
+
 ## v1.13.12
 
 ### 🚀 Features:
